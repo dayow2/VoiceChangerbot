@@ -1,14 +1,12 @@
 import os
 import io
+import asyncio
+import threading
 import requests
 from flask import Flask, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, 
-    MessageHandler, filters, ContextTypes
-)
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from pydub import AudioSegment
-import effects
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -16,10 +14,24 @@ load_dotenv()
 
 # === CONFIGURATION ===
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
-VOICEMOD_API_KEY = os.environ.get("VOICEMOD_API_KEY")
 PORT = int(os.environ.get("PORT", 5000))
 
-# === FLASK APP for Render Health Checks ===
+# Voice effects database (simplified - no external API needed)
+VOICE_EFFECTS = {
+    "robot": {"name": "🤖 Robot", "desc": "Metallic voice"},
+    "alien": {"name": "👽 Alien", "desc": "Extraterrestrial"},
+    "helium": {"name": "🎈 Helium", "desc": "High-pitched"},
+    "demon": {"name": "😈 Demon", "desc": "Deep voice"},
+    "baby": {"name": "🍼 Baby", "desc": "Cute voice"},
+    "echo": {"name": "🔄 Echo", "desc": "Repeating effect"},
+    "slow": {"name": "🐢 Slow", "desc": "Slowed down"},
+    "fast": {"name": "⚡ Fast", "desc": "Sped up"}
+}
+
+# User preferences
+user_preferences = {}
+
+# === FLASK APP ===
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -27,8 +39,42 @@ flask_app = Flask(__name__)
 def health_check():
     return jsonify({"status": "ok", "service": "Voice Changer Bot"}), 200
 
-# === VOICE PROCESSING FUNCTIONS ===
-def download_voice_file(file_id):
+# === SIMPLE VOICE EFFECTS (No API required) ===
+def apply_simple_effect(audio_bytes, effect_name):
+    """Apply basic audio effects using pydub"""
+    try:
+        # Load audio
+        audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format="ogg")
+        
+        # Apply effects
+        if effect_name == "slow":
+            audio = audio.speedup(playback_speed=0.7)
+        elif effect_name == "fast":
+            audio = audio.speedup(playback_speed=1.5)
+        elif effect_name == "echo":
+            # Simple echo by overlapping
+            echo = audio - 10  # Reduce volume
+            audio = audio.overlay(echo, position=200)
+        elif effect_name == "robot":
+            # Add distortion effect
+            audio = audio.low_pass_filter(1000).high_pass_filter(500)
+        elif effect_name == "helium":
+            # Speed up slightly for helium effect
+            audio = audio.speedup(playback_speed=1.2)
+        elif effect_name == "demon":
+            # Slow down and add bass
+            audio = audio.speedup(playback_speed=0.8).low_pass_filter(300)
+        
+        # Export to bytes
+        output = io.BytesIO()
+        audio.export(output, format="ogg")
+        output.seek(0)
+        return output
+    except Exception as e:
+        print(f"Effect error: {e}")
+        return None
+
+def download_voice(file_id):
     """Download voice message from Telegram"""
     url = f"https://api.telegram.org/bot{TOKEN}/getFile?file_id={file_id}"
     response = requests.get(url).json()
@@ -42,128 +88,53 @@ def download_voice_file(file_id):
     audio_response = requests.get(file_url)
     return io.BytesIO(audio_response.content)
 
-def convert_audio_format(audio_bytes, target_format='ogg'):
-    """Convert audio between formats using pydub"""
-    try:
-        # Load audio from bytes
-        audio = AudioSegment.from_ogg(io.BytesIO(audio_bytes))
-        
-        # Export to target format
-        output = io.BytesIO()
-        audio.export(output, format=target_format)
-        output.seek(0)
-        return output
-    except Exception as e:
-        print(f"Audio conversion error: {e}")
-        return None
-
-def apply_voice_effect(audio_bytes, effect_name):
-    """Apply voice effect using Voicemod API [citation:9]"""
-    
-    # Map effect names to Voicemod API names
-    effect_api_name = effects.get_effect(effect_name)
-    if effect_api_name:
-        effect_api_name = effect_api_name['api_name']
-    else:
-        effect_api_name = effect_name
-    
-    # Voicemod API endpoint
-    url = "https://api.voicemod.net/api/v1/effects/apply"
-    
-    headers = {
-        "X-API-Key": VOICEMOD_API_KEY,
-        "Content-Type": "audio/ogg"
-    }
-    
-    params = {
-        "effect": effect_api_name
-    }
-    
-    try:
-        response = requests.post(
-            url, 
-            headers=headers, 
-            params=params,
-            data=audio_bytes,
-            timeout=30
-        )
-        
-        if response.status_code == 200:
-            return io.BytesIO(response.content)
-        else:
-            print(f"API Error: {response.status_code} - {response.text}")
-            return None
-    except Exception as e:
-        print(f"Voice effect error: {e}")
-        return None
-
-# === TELEGRAM BOT HANDLERS ===
+# === TELEGRAM HANDLERS ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send welcome message when /start is issued."""
-    welcome_text = (
+    welcome = (
         "🎙️ *Welcome to Voice Changer Bot!*\n\n"
-        "I can transform your voice with awesome effects!\n\n"
         "*How to use:*\n"
         "1️⃣ Send me a voice message\n"
         "2️⃣ I'll apply an effect and send it back\n"
-        "3️⃣ Use /effects to see all available effects\n"
-        "4️⃣ Use /effect <name> to set your default effect\n\n"
+        "3️⃣ Use /effects to see all effects\n"
+        "4️⃣ Use /effect <name> to set default\n\n"
         "*Quick example:*\n"
-        "Send a voice message with caption 'robot' to apply robot effect!\n\n"
-        "*Current default effect:* `magic-chords`\n"
-        "Use /effects to see all 20+ effects! 🎭"
+        "Send voice with caption 'robot'\n\n"
+        "*Available effects:*\n"
+        "robot, alien, helium, demon, baby, echo, slow, fast\n\n"
+        "Use /help for more info!"
     )
-    await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    await update.message.reply_text(welcome, parse_mode='Markdown')
 
 async def show_effects(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show available voice effects with inline keyboard"""
-    all_effects = effects.get_all_effects()
-    
-    # Create effect list for message
-    effect_list = []
-    for effect_name in all_effects[:15]:  # Show first 15 in text
-        effect = effects.get_effect(effect_name)
-        effect_list.append(f"{effect['name']} - `{effect_name}`")
-    
-    effect_text = "\n".join(effect_list)
+    effects_list = "\n".join([f"• `{name}` - {data['name']}" for name, data in VOICE_EFFECTS.items()])
     
     message = (
         "*🎭 Available Voice Effects:*\n\n"
-        f"{effect_text}\n\n"
-        f"*+ {len(all_effects) - 15} more effects!*\n\n"
+        f"{effects_list}\n\n"
         "*To use:*\n"
         "• Set default: `/effect robot`\n"
-        "• One-time use: Send voice with caption 'robot'\n\n"
-        "*Current default:* `{0}`"
-    ).format(effects.get_user_effect(update.effective_user.id))
+        "• One-time: Send voice with caption 'robot'\n\n"
+        f"*Current default:* `{user_preferences.get(str(update.effective_user.id), 'None')}`"
+    )
     
-    # Create inline keyboard with effect buttons
+    # Create inline keyboard
     keyboard = []
     row = []
-    for i, effect_name in enumerate(all_effects[:8]):  # Show 8 in buttons
-        effect = effects.get_effect(effect_name)
-        row.append(InlineKeyboardButton(
-            effect['name'], 
-            callback_data=f"set_effect_{effect_name}"
-        ))
-        if len(row) == 2:  # 2 buttons per row
+    for name, data in list(VOICE_EFFECTS.items())[:4]:
+        row.append(InlineKeyboardButton(data['name'], callback_data=f"effect_{name}"))
+        if len(row) == 2:
             keyboard.append(row)
             row = []
     if row:
         keyboard.append(row)
     
-    # Add reset button
-    keyboard.append([InlineKeyboardButton("🔄 Reset to Default", callback_data="set_effect_default")])
-    
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(message, parse_mode='Markdown', reply_markup=reply_markup)
 
 async def set_effect(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set default effect for user"""
     if not context.args:
         await update.message.reply_text(
-            "❌ Please specify an effect!\n"
-            "Usage: `/effect robot`\n"
+            "❌ Usage: `/effect robot`\n"
             "Use /effects to see all effects.",
             parse_mode='Markdown'
         )
@@ -171,12 +142,11 @@ async def set_effect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     effect_name = context.args[0].lower()
     
-    if effect_name in effects.get_all_effects():
-        effects.set_user_effect(update.effective_user.id, effect_name)
-        effect = effects.get_effect(effect_name)
+    if effect_name in VOICE_EFFECTS:
+        user_preferences[str(update.effective_user.id)] = effect_name
         await update.message.reply_text(
-            f"✅ Default effect set to: {effect['name']}\n"
-            f"Send me a voice message to hear it!"
+            f"✅ Default effect set to: {VOICE_EFFECTS[effect_name]['name']}\n"
+            "Send me a voice message to hear it!"
         )
     else:
         await update.message.reply_text(
@@ -185,88 +155,72 @@ async def set_effect(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Process voice message with effect"""
-    
     # Determine which effect to use
-    # Priority: 1. Caption text, 2. User default, 3. Global default
-    effect = effects.DEFAULT_EFFECT
+    effect = user_preferences.get(str(update.effective_user.id))
     
     # Check if user specified effect in caption
     if update.message.caption:
         caption_effect = update.message.caption.lower().strip()
-        if caption_effect in effects.get_all_effects():
+        if caption_effect in VOICE_EFFECTS:
             effect = caption_effect
     
-    # If no caption effect, use user's default
-    if effect == effects.DEFAULT_EFFECT:
-        user_effect = effects.get_user_effect(update.effective_user.id)
-        if user_effect:
-            effect = user_effect
+    if not effect:
+        await update.message.reply_text(
+            "🎙️ Please specify an effect!\n\n"
+            "• Send voice with caption 'robot'\n"
+            "• Or set default: `/effect robot`\n"
+            "• See all: /effects",
+            parse_mode='Markdown'
+        )
+        return
     
-    effect_name = effects.get_effect(effect)
-    if effect_name:
-        effect_display = effect_name['name']
-    else:
-        effect_display = effect
+    effect_name = VOICE_EFFECTS.get(effect, {}).get('name', effect)
     
     # Send processing message
-    processing_msg = await update.message.reply_text(
-        f"🎛️ Processing your voice with **{effect_display}** effect...",
-        parse_mode='Markdown'
-    )
+    processing = await update.message.reply_text(f"🎛️ Applying **{effect_name}** effect...", parse_mode='Markdown')
     
     try:
-        # Download voice message
-        voice_file = update.message.voice
-        audio_bytes = download_voice_file(voice_file.file_id)
+        # Download voice
+        voice = update.message.voice
+        audio_bytes = download_voice(voice.file_id)
         
         if not audio_bytes:
-            await processing_msg.edit_text("❌ Failed to download voice message. Please try again.")
+            await processing.edit_text("❌ Failed to download voice. Try again!")
             return
         
-        # Apply voice effect
-        processed_audio = apply_voice_effect(audio_bytes.getvalue(), effect)
+        # Apply effect
+        processed = apply_simple_effect(audio_bytes.getvalue(), effect)
         
-        if not processed_audio:
-            await processing_msg.edit_text(
-                "❌ Failed to apply effect. Please try again with a shorter voice message (max 30 seconds)."
-            )
+        if not processed:
+            await processing.edit_text("❌ Failed to apply effect. Try a shorter message!")
             return
         
-        # Send processed voice back
+        # Send result
         await update.message.reply_voice(
-            voice=processed_audio,
-            caption=f"✨ Your voice with **{effect_display}** effect!\nUse /effects to try others!",
+            voice=processed,
+            caption=f"✨ Your voice with **{effect_name}** effect!\nUse /effects to try others!",
             parse_mode='Markdown'
         )
         
-        await processing_msg.delete()
+        await processing.delete()
         
     except Exception as e:
-        await processing_msg.edit_text(f"❌ Error: {str(e)}\nPlease try again with a shorter voice message.")
-        print(f"Error processing voice: {e}")
+        await processing.edit_text(f"❌ Error: {str(e)[:50]}")
+        print(f"Error: {e}")
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline keyboard callbacks"""
     query = update.callback_query
     await query.answer()
     
-    if query.data.startswith("set_effect_"):
-        effect_name = query.data.replace("set_effect_", "")
-        
-        if effect_name == "default":
-            effect_name = effects.DEFAULT_EFFECT
-        
-        if effect_name in effects.get_all_effects() or effect_name == effects.DEFAULT_EFFECT:
-            effects.set_user_effect(query.from_user.id, effect_name)
-            effect = effects.get_effect(effect_name) if effect_name != effects.DEFAULT_EFFECT else {"name": "Magic Chords"}
-            await query.edit_message_text(
-                f"✅ Default effect set to: {effect['name'] if effect_name != effects.DEFAULT_EFFECT else 'Magic Chords'}\n"
-                f"Send me a voice message to hear it!"
-            )
+    if query.data.startswith("effect_"):
+        effect_name = query.data.replace("effect_", "")
+        user_preferences[str(query.from_user.id)] = effect_name
+        await query.edit_message_text(
+            f"✅ Default effect set to: {VOICE_EFFECTS[effect_name]['name']}\n"
+            "Send me a voice message to hear it!"
+        )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send help message."""
     help_text = (
         "*🤖 Voice Changer Bot Help*\n\n"
         "*Commands:*\n"
@@ -275,27 +229,31 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/effects - List all voice effects\n"
         "/effect <name> - Set default effect\n\n"
         "*How to use:*\n"
-        "• Send voice message with caption = effect name (one-time)\n"
-        "• Set default with /effect, then just send voice\n"
-        "• Choose from 20+ effects!\n\n"
+        "• Send voice message with caption = effect name\n"
+        "• Set default with /effect, then just send voice\n\n"
         "*Examples:*\n"
         "• `/effect robot` - Set robot as default\n"
-        "• Send voice with caption 'alien' - Apply alien effect once\n\n"
-        "*Tip:* Effects work best with clear speech and < 30 seconds!"
+        "• Send voice with caption 'alien' - Apply alien effect\n\n"
+        "*Available effects:*\n"
+        "robot, alien, helium, demon, baby, echo, slow, fast"
     )
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle errors"""
     print(f"Error: {context.error}")
     if update and update.effective_message:
-        await update.effective_message.reply_text(
-            "An error occurred. Please try again later."
-        )
+        await update.effective_message.reply_text("An error occurred. Please try again.")
 
-# === MAIN FUNCTION ===
+# === MAIN ===
 async def main():
-    """Initialize and run the Telegram bot."""
+    """Initialize and run bot"""
+    if not TOKEN:
+        print("❌ TELEGRAM_TOKEN environment variable not set!")
+        return
+    
+    print(f"🤖 Starting Voice Changer Bot...")
+    print(f"📍 Token: {TOKEN[:10]}...")
+    
     # Create application
     application = Application.builder().token(TOKEN).build()
     
@@ -308,20 +266,22 @@ async def main():
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_error_handler(error_handler)
     
-    # Start bot with polling
-    print("🎤 Voice Changer Bot is starting...")
+    # Start bot
+    print("✅ Bot handlers registered")
+    print("🚀 Starting polling...")
+    
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
     
-    print("✅ Voice Changer Bot is running successfully!")
+    print("✅ Bot is running successfully!")
     
-    # Keep bot running
+    # Keep running
     try:
         while True:
             await asyncio.sleep(3600)
     except KeyboardInterrupt:
-        pass
+        print("\n⏹️ Stopping bot...")
     finally:
         await application.updater.stop()
         await application.stop()
@@ -329,21 +289,16 @@ async def main():
 
 # === ENTRY POINT ===
 if __name__ == "__main__":
-    import asyncio
-    import threading
-    
-    # Run Flask in a separate thread for health checks
+    # Run Flask in background thread
     def run_flask():
         flask_app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
     
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
+    print(f"✅ Flask health check server running on port {PORT}")
     
-    # Run the bot
+    # Run bot
     try:
         asyncio.run(main())
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(main())
+    except Exception as e:
+        print(f"❌ Fatal error: {e}")
